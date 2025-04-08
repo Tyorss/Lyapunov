@@ -6,11 +6,12 @@ from scipy.stats import linregress
 from scipy.spatial.distance import pdist, squareform
 import nolds # 비선형 시계열 분석 라이브러리
 import os
+from pathlib import Path
 
 # 'data' 폴더 생성
-os.makedirs('data', exist_ok=True)
+Path('data').mkdir(exist_ok=True)
 # 'images' 폴더 생성
-os.makedirs('images', exist_ok=True)
+Path('images').mkdir(exist_ok=True)
 
 # --- 함수 정의: 상관 합 계산 ---
 def embed_data(data, emb_dim, lag=1):
@@ -186,11 +187,34 @@ print(f"\n최대 리아프노프 지수(LLE) 계산 중 (m={m_for_lle})...")
 try:
     # 데이터를 float64로 변환
     price_series_float = np.array(analysis_data, dtype=np.float64)
-    LLE = nolds.lyap_r(price_series_float, emb_dim=m_for_lle, lag=1, min_tsep=10)
+    # debug_data=True로 설정하여 중간 계산 결과 얻기
+    LLE, debug_data_output = nolds.lyap_r(price_series_float, emb_dim=m_for_lle, lag=1, min_tsep=10, debug_data=True)
     print(f"LLE = {LLE:.3f}")
+    
+    # LLE 수렴 과정 시각화
+    # debug_data_output[0]은 시간 스텝 (evolution time)
+    # debug_data_output[1]은 각 시간 스텝에서의 평균 로그 발산값
+    evolution_time = debug_data_output[0]
+    mean_log_divergence = debug_data_output[1]
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(evolution_time, mean_log_divergence, '-', linewidth=1)
+    # 최종 LLE 값을 수평선으로 표시
+    plt.axhline(LLE, color='r', linestyle='--', label=f'Final LLE = {LLE:.3f}')
+    
+    plt.title(f'Convergence of Largest Lyapunov Exponent (m={m_for_lle})')
+    plt.xlabel('Evolution Time (steps)')
+    plt.ylabel('Mean Log Divergence (Lyapunov Exponent)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('images/lle_convergence.png')
+    plt.close()
+    print("LLE 수렴 그래프 저장 완료: images/lle_convergence.png")
+    
 except Exception as e:
-    print(f"LLE 계산 중 예외 발생: {str(e)}")
+    print(f"LLE 계산 또는 그래프 생성 중 예외 발생: {str(e)}")
     LLE = None
+    # 오류 발생 시에도 이후 코드가 실행되도록 None 할당
 
 # --- 5. 결과 시각화 및 해석 ---
 
