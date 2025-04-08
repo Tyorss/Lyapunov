@@ -67,30 +67,37 @@ data = yf.download('SPY', start=start_date, end=end_date)  # SPY 데이터
 # 'Close' 가격 사용 (최신 yfinance에서는 'Adj Close' 대신 'Close' 사용)
 price = data['Close'].dropna()
 
+# --- 월별 데이터 및 로그 수익률 계산 ---
+# 일별 가격을 월별로 리샘플링 (월말 값 사용)
+monthly_price = price.resample('M').last()
+
 # 로그 변환
-log_price = np.log(price)
+monthly_log_price = np.log(monthly_price)
 
-# 추세 제거 (Log-Linear Detrending)
-t = np.arange(len(log_price)).reshape(-1, 1)  # 2D 배열로 변환
-log_price_values = log_price.values.reshape(-1, 1)  # 2D 배열로 변환
-slope, intercept, r_value, p_value, std_err = linregress(t.flatten(), log_price_values.flatten())
-linear_trend = intercept + slope * t.flatten()
-detrended_log_price = log_price_values.flatten() - linear_trend
+# 월별 로그 수익률 계산 (ln(P_t/P_{t-1}))
+monthly_returns = monthly_log_price.diff().dropna()
 
-# 원본, 로그, 디트렌드 데이터 시각화 (확인용)
-plt.figure(figsize=(12, 8))
-plt.subplot(3, 1, 1); plt.plot(price.index, price); plt.title(f'{ticker} Close Price'); plt.ylabel('Price')
-plt.subplot(3, 1, 2); plt.plot(log_price.index, log_price); plt.plot(log_price.index, linear_trend, 'r--', label='Linear Trend'); plt.title(f'{ticker} Log Price and Trend'); plt.ylabel('Log Price'); plt.legend()
-plt.subplot(3, 1, 3); plt.plot(price.index, detrended_log_price); plt.title(f'{ticker} Detrended Log Price'); plt.ylabel('Detrended Log Price'); plt.xlabel('Date')
+# 추세 제거 (월별 데이터에 대해)
+t_monthly = np.arange(len(monthly_returns)).reshape(-1, 1)
+monthly_returns_values = monthly_returns.values.reshape(-1, 1)
+slope_monthly, intercept_monthly, r_value_monthly, p_value_monthly, std_err_monthly = linregress(t_monthly.flatten(), monthly_returns_values.flatten())
+linear_trend_monthly = intercept_monthly + slope_monthly * t_monthly.flatten()
+detrended_monthly_returns = monthly_returns_values.flatten() - linear_trend_monthly
+
+# 생성된 월별 데이터 확인을 위한 시각화
+plt.figure(figsize=(12, 9))
+plt.subplot(3, 1, 1); plt.plot(monthly_price.index, monthly_price); plt.title(f'{ticker} Monthly Close Price'); plt.ylabel('Price')
+plt.subplot(3, 1, 2); plt.plot(monthly_returns.index, monthly_returns); plt.title(f'{ticker} Monthly Log Returns'); plt.ylabel('Log Returns')
+plt.subplot(3, 1, 3); plt.plot(monthly_returns.index, detrended_monthly_returns); plt.title(f'{ticker} Detrended Monthly Log Returns'); plt.ylabel('Detrended Log Returns'); plt.xlabel('Date')
 plt.tight_layout()
-plt.savefig('images/price_analysis.png')
+plt.savefig('images/monthly_analysis.png')
 plt.close()
 
 # --- 2. 상관차원(Correlation Dimension) 계산 (D vs m) ---
 # CHAOS_PART3.pdf p.19-22 [source: 100-106], p.44-51 [source: 131-138] 참고
 
 # 분석할 데이터 (추세 제거된 로그 가격)
-analysis_data = detrended_log_price
+analysis_data = detrended_monthly_returns
 
 # 임베딩 차원 범위 설정 (PDF p.18 [source: 97] 2~10 추천)
 min_m = 2
@@ -133,7 +140,7 @@ for m in embedding_dims:
 # CHAOS_PART3.pdf Figure 13.18, 13.19 스타일
 
 # 상관 적분 계산을 위한 파라미터 설정
-m_for_integral = 5 # 상관차원이 수렴하기 시작하는 m 값 선택 (예시)
+m_for_integral = 8 # 상관차원이 수렴하는 임베딩 차원 값 선택
 if m_for_integral > max_m:
     m_for_integral = max_m
 elif m_for_integral < min_m:
@@ -173,48 +180,279 @@ except Exception as e:
 
 # --- 4. 최대 리아프노프 지수 (LLE) 계산 ---
 # CHAOS_PART3.pdf p.23-29 [source: 107-115], p.52-56 [source: 139-143] 참고
-# Rosenstein et al. (1993) 알고리즘 사용 (nolds.lyap_r)
+# Wolf et al. (1985) 알고리즘 사용
 
-# LLE 계산을 위한 임베딩 차원 선택
-# 상관차원이 수렴하기 시작하는 값 또는 그보다 약간 큰 값을 선택
-# 예: 상관차원이 3 근처에서 수렴하기 시작하면 m=4 또는 5 선택
-# 여기서는 예시로 m=5 사용 (실제 분석에서는 D vs m 그래프 보고 결정)
-m_for_lle = m_for_integral # 상관 적분 계산에 사용한 m과 동일하게 설정 (일관성)
-if m_for_lle > max_m:
-    m_for_lle = max_m # 설정한 최대 m 값을 넘지 않도록
+def wolf_lyapunov(data, m, tau, dt=1, t_evolve=5, eps_min_factor=0.0001, eps_max_factor=0.5):
+    """Wolf et al. (1985) 방법으로 최대 리아프노프 지수 계산
 
-print(f"\n최대 리아프노프 지수(LLE) 계산 중 (m={m_for_lle})...")
+    Parameters:
+    -----------
+    data : array
+        시계열 데이터 (1D numpy array)
+    m : int
+        임베딩 차원
+    tau : int
+        시간 지연
+    dt : float
+        시간 간격 (기본값=1)
+    t_evolve : int
+        각 스텝에서 궤적을 따라가는 시간 (기본값=5)
+    eps_min_factor : float
+        최소 거리 계산을 위한 데이터 표준편차 비율 (기본값=0.0001)
+    eps_max_factor : float
+        최대 거리 계산을 위한 데이터 표준편차 비율 (기본값=0.5)
+
+    Returns:
+    --------
+    lambda1 : float
+        최대 리아프노프 지수 추정치
+    evolution_time : list
+        각 추정치가 계산된 시간 스텝
+    evolution_lambda : list
+        시간에 따른 리아프노프 지수 추정치
+    """
+    if len(data) < (m - 1) * tau + t_evolve + 1:
+        raise ValueError("데이터 길이가 너무 짧습니다.")
+
+    # 위상 공간 재구성
+    Y = embed_data(data, m, tau)
+    n_points = len(Y)
+    data_std = np.std(data)
+    eps_min = data_std * eps_min_factor
+    eps_max = data_std * eps_max_factor
+
+    # 발산 추적을 위한 변수 초기화
+    L = 0.0  # 누적 log(거리비)
+    n_steps = 0
+    evolution_time = []
+    evolution_lambda = []
+
+    # 초기 기준점 및 이웃점 찾기
+    current_point_idx = 0
+    fiducial = Y[current_point_idx]
+    distances = np.linalg.norm(Y - fiducial, axis=1)
+    
+    # 검색 방법 개선: 자기 자신 제외
+    distances[current_point_idx] = np.inf
+    
+    # 이웃 검색 범위 조정
+    valid_indices = np.where((distances > eps_min) & (distances < eps_max))[0]
+
+    if len(valid_indices) == 0:
+        # 이웃점을 찾지 못한 경우, eps_max를 점진적으로 늘려 재시도
+        for scale in [2.0, 5.0, 10.0]:
+            temp_eps_max = eps_max * scale
+            valid_indices = np.where((distances > eps_min) & (distances < temp_eps_max))[0]
+            if len(valid_indices) > 0:
+                print(f"이웃점 검색 범위 조정: eps_max = {temp_eps_max:.5f}")
+                eps_max = temp_eps_max  # 성공한 값으로 업데이트
+                break
+        
+        # 여전히 이웃점을 찾지 못한 경우
+        if len(valid_indices) == 0:
+            print(f"Warning: 초기 이웃점을 찾을 수 없습니다. eps_min={eps_min:.5f}, eps_max={eps_max:.5f}")
+            return np.nan, [], []
+
+    neighbor_idx = valid_indices[np.argmin(distances[valid_indices])]
+    d0 = distances[neighbor_idx]
+
+    # 시간 진화 시작
+    while current_point_idx + t_evolve < n_points and neighbor_idx + t_evolve < n_points:
+        # 현재 점과 이웃점의 궤적 추적
+        fiducial_evolved = Y[current_point_idx + t_evolve]
+        neighbor_evolved = Y[neighbor_idx + t_evolve]
+
+        # 발산된 거리 계산
+        d1 = np.linalg.norm(fiducial_evolved - neighbor_evolved)
+
+        # 로그 거리비 누적 및 LLE 추정치 업데이트
+        if d1 > eps_min and d0 > eps_min : # 유효한 거리값 확인
+            L += np.log(d1 / d0)
+            n_steps += t_evolve # t_evolve 만큼 시간이 경과
+            current_time = n_steps * dt
+            evolution_time.append(current_time)
+            evolution_lambda.append(L / current_time)
+
+            # 다음 스텝 준비: 이웃점 교체
+            current_point_idx += t_evolve
+            fiducial = Y[current_point_idx]
+
+            # 새로운 이웃점 찾기 (각도 제약 포함 시 더 정확하나 복잡해짐)
+            # 여기서는 간단히 거리 기준 사용
+            distances = np.linalg.norm(Y - fiducial, axis=1)
+            distances[current_point_idx] = np.inf # 자기 자신 제외
+
+            # 이웃 검색 범위 조정
+            valid_indices = np.where((distances > eps_min) & (distances < eps_max))[0]
+
+            if len(valid_indices) == 0:
+                # 이웃점을 찾지 못한 경우, eps_max를 점진적으로 늘려 재시도
+                for scale in [2.0, 5.0, 10.0]:
+                    temp_eps_max = eps_max * scale
+                    valid_indices = np.where((distances > eps_min) & (distances < temp_eps_max))[0]
+                    if len(valid_indices) > 0:
+                        eps_max = temp_eps_max  # 성공한 값으로 업데이트
+                        break
+                
+                # 여전히 이웃점을 찾지 못한 경우
+                if len(valid_indices) == 0:
+                    break # 이웃 못찾으면 종료
+
+            neighbor_idx = valid_indices[np.argmin(distances[valid_indices])]
+            d0 = distances[neighbor_idx]
+        else:
+            # 유효한 발산 계산 불가 시 다음 스텝으로
+             current_point_idx += t_evolve
+             if current_point_idx + t_evolve < n_points:
+                 fiducial = Y[current_point_idx]
+                 distances = np.linalg.norm(Y - fiducial, axis=1)
+                 valid_indices = np.where((distances > eps_min) & (distances < eps_max))[0]
+                 if len(valid_indices) == 0:
+                     break
+                 neighbor_idx = valid_indices[np.argmin(distances[valid_indices])]
+                 d0 = distances[neighbor_idx]
+             else:
+                 break
+
+    # 최종 리아프노프 지수 계산
+    lambda1 = L / (n_steps * dt) if n_steps > 0 else np.nan
+
+    return lambda1, evolution_time, evolution_lambda
+
+# Wolf 방법을 사용하여 "점진적으로 데이터를 늘려가며" LLE 추정
+def progressive_wolf_lle(data, m, tau, min_samples=50, step_size=10, t_evolve=5, eps_min_factor=0.0001, eps_max_factor=0.5):
+    """점진적으로 데이터를 늘려가며 Wolf 방법으로 LLE를 추정합니다."""
+    n_samples = len(data)
+    if n_samples < min_samples:
+        raise ValueError(f"데이터 길이({n_samples})가 최소 샘플 수({min_samples})보다 작습니다.")
+    
+    # 결과 저장용 변수
+    evolution_time = []  # 분석에 사용된 데이터 길이
+    evolution_lambda = []  # 추정된 LLE 값
+    
+    # 데이터를 점진적으로 늘려가며 LLE 추정
+    for i in range(min_samples, n_samples + 1, step_size):
+        subset = data[:i]  # 처음부터 i개까지의 데이터
+        try:
+            lle, _, _ = wolf_lyapunov(
+                subset, 
+                m=m, 
+                tau=tau, 
+                t_evolve=t_evolve,
+                eps_min_factor=eps_min_factor,
+                eps_max_factor=eps_max_factor
+            )
+            if not np.isnan(lle):
+                evolution_time.append(i)
+                evolution_lambda.append(lle)
+                print(f"데이터 길이 {i}: LLE = {lle:.4f}")
+        except Exception as e:
+            print(f"데이터 길이 {i}에서 오류 발생: {str(e)}")
+    
+    # 최종 LLE는 전체 데이터로 계산한 값
+    final_lle = evolution_lambda[-1] if evolution_lambda else np.nan
+    
+    return final_lle, evolution_time, evolution_lambda
+
+print("\n최대 리아프노프 지수(LLE) Figure 13.13 스타일 분석 중...")
+
 try:
-    # 데이터를 float64로 변환
-    price_series_float = np.array(analysis_data, dtype=np.float64)
-    # debug_data=True로 설정하여 중간 계산 결과 얻기
-    LLE, debug_data_output = nolds.lyap_r(price_series_float, emb_dim=m_for_lle, lag=1, min_tsep=10, debug_data=True)
-    print(f"LLE = {LLE:.3f}")
+    # 월별 로그 수익률 데이터를 numpy 배열로 변환
+    monthly_data = np.array(detrended_monthly_returns, dtype=np.float64)
     
-    # LLE 수렴 과정 시각화
-    # debug_data_output[0]은 시간 스텝 (evolution time)
-    # debug_data_output[1]은 각 시간 스텝에서의 평균 로그 발산값
-    evolution_time = debug_data_output[0]
-    mean_log_divergence = debug_data_output[1]
+    # 데이터 표준화 (평균=0, 표준편차=1)
+    mean_monthly = np.mean(monthly_data)
+    std_monthly = np.std(monthly_data)
+    standardized_monthly_data = (monthly_data - mean_monthly) / std_monthly
     
-    plt.figure(figsize=(10, 6))
-    plt.plot(evolution_time, mean_log_divergence, '-', linewidth=1)
-    # 최종 LLE 값을 수평선으로 표시
-    plt.axhline(LLE, color='r', linestyle='--', label=f'Final LLE = {LLE:.3f}')
+    print(f"\n월별 데이터 통계: 개수={len(standardized_monthly_data)}, 평균={mean_monthly:.6f}, 표준편차={std_monthly:.6f}")
     
-    plt.title(f'Convergence of Largest Lyapunov Exponent (m={m_for_lle})')
-    plt.xlabel('Evolution Time (steps)')
-    plt.ylabel('Mean Log Divergence (Lyapunov Exponent)')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig('images/lle_convergence.png')
-    plt.close()
-    print("LLE 수렴 그래프 저장 완료: images/lle_convergence.png")
+    # 임베딩 차원을 약간 높여서 시도 (금융 로그 수익률 데이터에 적합한 값)
+    m_for_lle = 8  # 더 높은 임베딩 차원으로 시도
     
+    # 최소 40개월부터 시작하여 5개월씩 늘려가며 LLE 추정 (더 세밀한 진행)
+    final_lle, evolution_time, evolution_lambda = progressive_wolf_lle(
+        standardized_monthly_data,  # 표준화된 데이터 사용
+        m=m_for_lle,
+        tau=1,
+        min_samples=40,  # 최소 40개월부터 시작 (더 빠른 시점부터)
+        step_size=5,     # 5개월씩 증가 (더 세밀한 진행)
+        t_evolve=3,      # 시간 단계를 더 짧게 (더 세밀한 추적)
+        eps_min_factor=0.005,  # 최소 거리 비율 수정
+        eps_max_factor=0.4     # 최대 거리 비율 수정
+    )
+    
+    if not np.isnan(final_lle) and evolution_lambda:
+        print(f"\n최종 LLE = {final_lle:.4f} bit/month")
+        print(f"예측 가능 기간: {1/final_lle:.1f} 개월")
+        
+        # Figure 13.13 스타일 그래프 생성
+        plt.figure(figsize=(10, 6))
+        
+        # 실선 그래프 (검은색, 얇은 선)
+        plt.plot(evolution_time, evolution_lambda, '-k', linewidth=1)
+        
+        # 최종 LLE 값을 수평선으로 표시 (검은색 실선)
+        plt.axhline(final_lle, color='k', linestyle='-', linewidth=1)
+        
+        # 0 기준선 (얇은 실선)
+        plt.axhline(0, color='k', linewidth=0.5)
+        
+        # LLE 값 텍스트 추가
+        text_x = np.mean(evolution_time)
+        plt.text(text_x, final_lle + 0.01, f'L₁ = {final_lle:.4f} bit/month', fontsize=10,
+                verticalalignment='bottom', horizontalalignment='center')
+        
+        # 축 레이블 및 제목 설정
+        plt.title('Convergence of the largest Lyapunov exponent')
+        plt.xlabel('TIME')
+        plt.ylabel('LYAPUNOV EXPONENT')
+        
+        # Y축 범위 설정 (초기 높은 값을 포함하도록)
+        # 더 넓은 범위로 조정
+        y_max = max(0.35, max(evolution_lambda[:min(5, len(evolution_lambda))]) * 1.1)
+        plt.ylim(-0.02, y_max)
+        
+        # X축 범위 설정 (0부터 시작)
+        plt.xlim(0, max(evolution_time))
+        
+        # 격자 제거
+        plt.grid(False)
+        
+        # 테두리 선 두껍게
+        plt.gca().spines['top'].set_linewidth(1.0)
+        plt.gca().spines['right'].set_linewidth(1.0)
+        plt.gca().spines['bottom'].set_linewidth(1.0)
+        plt.gca().spines['left'].set_linewidth(1.0)
+        
+        # 저장
+        plt.savefig('images/lle_convergence_fig13_13_style.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print("Figure 13.13 스타일 LLE 수렴 그래프 저장 완료: images/lle_convergence_fig13_13_style.png")
+    else:
+        print("LLE 계산 결과가 충분하지 않습니다. 데이터나 파라미터를 조정해보세요.")
+
 except Exception as e:
     print(f"LLE 계산 또는 그래프 생성 중 예외 발생: {str(e)}")
-    LLE = None
-    # 오류 발생 시에도 이후 코드가 실행되도록 None 할당
+    final_lle = None
+
+# 결과 해석 업데이트
+print("\n--- 결과 해석 ---")
+print(f"분석 기간: {start_date} ~ {end_date}")
+print(f"사용 데이터: {ticker} (월별 로그 수익률, 추세 제거)")
+
+if final_lle is not None and not np.isnan(final_lle):
+    print("\n최대 리아프노프 지수 (Largest Lyapunov Exponent, LLE):")
+    print(f"  - 월별 LLE = {final_lle:.4f} bit/month")
+    predictability_horizon = 1.0 / final_lle if final_lle > 0 else np.inf
+    print(f"  - 예측 가능 기간: 약 {predictability_horizon:.1f} 개월")
+    
+    if final_lle > 0:
+        print("  - 양의 리아프노프 지수는 시스템이 초기 조건에 민감하게 반응하는 카오스적 특성을 가짐을 시사")
+        print("  - 예측 가능 기간은 현재 상태의 영향력이 소멸되는 시간 척도를 의미")
+else:
+    print("  - LLE 계산에 실패했거나 계산되지 않았습니다.")
 
 # --- 5. 결과 시각화 및 해석 ---
 
@@ -233,63 +471,6 @@ plt.grid(True)
 plt.xticks(embedding_dims)
 plt.savefig('images/correlation_dimension.png')
 plt.close()
-
-# 결과 해석 출력
-print("\n--- 결과 해석 ---")
-print(f"분석 기간: {start_date} ~ {end_date}")
-print(f"사용 데이터: {ticker} (Detrended Log Price)")
-
-print("\n1. 상관차원 (Correlation Dimension):")
-if not np.isnan(D2_values).all():
-    # 수렴 여부 판단 (간단한 방식: 마지막 몇 개의 값 변화 확인)
-    convergence_threshold = 0.1 # 예시 임계값
-    converged = False
-    converged_value = np.nan
-    if len(D2_values) >= 3:
-         # 마지막 3개 값들의 표준편차 확인
-        last_dims = [d for d in D2_values[-3:] if not np.isnan(d)]
-        if len(last_dims) >= 2 and np.std(last_dims) < convergence_threshold:
-             converged = True
-             converged_value = np.mean(last_dims)
-
-    if converged:
-        print(f"  - 원본 데이터의 상관차원은 임베딩 차원(m) {embedding_dims[-3]}~{embedding_dims[-1]} 에서 약 {converged_value:.2f} 로 수렴하는 경향을 보입니다.")
-        print(f"  - 이는 시스템의 동역학이 약 {int(np.ceil(converged_value))}개의 변수로 설명될 수 있는 저차원 구조를 가질 수 있음을 시사합니다.")
-        print(f"  - ([source: 101] CHAOS_PART3.pdf p.19)")
-    else:
-        print(f"  - 원본 데이터의 상관차원이 m={max_m}까지 명확하게 수렴하지 않았습니다. 더 높은 m 값 또는 다른 파라미터로 분석이 필요할 수 있습니다.")
-
-    # Scrambled 데이터 비교
-    print(f"  - Scrambled 데이터의 상관차원은 m이 증가함에 따라 계속 증가하는 경향(D ≈ m)을 보입니다.")
-    print(f"  - 이는 원본 데이터에서 관찰된 (만약 있다면) 상관차원의 수렴 현상이 데이터의 시간적 구조(동역학)에 의한 것임을 뒷받침합니다.")
-    print(f"  - ([source: 145] CHAOS_PART3.pdf p.58 비교 참고)")
-
-else:
-     print("  - 원본 데이터 상관차원 계산에 실패했습니다.")
-
-
-print("\n2. 최대 리아프노프 지수 (Largest Lyapunov Exponent, LLE):")
-if LLE is not None:
-    if LLE > 0:
-        print(f"  - 계산된 LLE는 {LLE:.3f} 로 양수(+) 입니다.")
-        print(f"  - 이는 KOSPI 지수가 해당 기간 동안 초기 조건에 민감하게 반응하는 카오스적 특성을 가질 수 있음을 시사합니다.")
-        print(f"  - ([source: 91] CHAOS_PART3.pdf p.13, [source: 107] p.23)")
-        # 예측 가능성 해석 (PDF p.59 [source: 146] 참고)
-        predictability_horizon = 1.0 / LLE if LLE > 0 else np.inf
-        print(f"  - 예측 가능성 한계 (1/LLE): 약 {predictability_horizon:.1f} 일. 이는 현재 정보의 영향력이 평균적으로 약 {predictability_horizon:.1f}일 후에는 소멸됨을 의미할 수 있습니다.")
-    elif LLE == 0:
-        print(f"  - 계산된 LLE는 0 입니다. 시스템이 주기적이거나 준주기적일 수 있습니다.")
-    else: # LLE < 0
-        print(f"  - 계산된 LLE는 {LLE:.3f} 로 음수(-) 입니다. 시스템이 안정적(수렴)일 수 있습니다.")
-        print(f"  - 카오스 분석 결과와 일치하지 않을 수 있으며, 데이터나 파라미터 설정을 재검토해야 할 수 있습니다.")
-else:
-     print("  - LLE 계산에 실패했거나 계산되지 않았습니다.")
-
-print("\n--- 주의사항 ---")
-print("- 이 분석은 특정 기간과 데이터, 파라미터 설정에 기반한 결과입니다.")
-print("- 금융 데이터는 노이즈가 많고 비정상성(Non-stationarity)을 가질 수 있어 해석에 주의가 필요합니다.")
-print("- 파라미터(m 범위, LLE 계산 시 lag 등) 선택에 따라 결과가 달라질 수 있습니다.")
-print("- `nolds` 외 다른 라이브러리(e.g., `nolitsa`)나 직접 구현을 통해 결과를 교차 검증하는 것이 좋습니다.")
 
 # --- 6. 데이터 및 코드 저장 ---
 # 결과를 재현 가능하도록 데이터와 코드 저장
